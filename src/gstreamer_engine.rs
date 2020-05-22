@@ -51,8 +51,8 @@ fn is_using_nouveau() -> bool {
 /// the television or radio channel.
 #[derive(Debug)]
 pub struct GStreamerEngine {
+    deinterlace_sink: gst::Bin,
     playbin: gst::Element,
-    video_element: gst::Element,
     pub video_widget: gtk::Widget, // FrontendWindow uses this for the overlay.
 }
 
@@ -153,13 +153,52 @@ impl GStreamerEngine {
             );
             return Err(())
         }
+        let flags = playbin.get_property("flags").unwrap();
+        let flags_class = glib::FlagsClass::new(flags.type_()).unwrap();
+        let flags_builder = flags_class.builder_with_value(flags).unwrap();
+        let flags = flags_builder.unset_by_nick("deinterlace").build().unwrap();
+        playbin.set_property("flags", &flags).unwrap();
+
+        let video_element = video_element.unwrap();
+        video_element.set_property("force-aspect-ratio", &true.to_value()).expect("Could not set 'force-aspect-ratio' property");
+
+        let videoconvert_element = if is_using_nouveau() {
+            gst::ElementFactory::make("videoconvert", None).expect("Failed to create videoconvert element")
+        } else {
+            gst::ElementFactory::make("glcolorconvert", None).expect("Failed to create glcolorconvert element")
+        };
+
+        let deinterlace_element = if is_using_nouveau() {
+            gst::ElementFactory::make("deinterlace", None).expect("Failed to create deinterlace element")
+        } else {
+            gst::ElementFactory::make("gldeinterlace", None).expect("Failed to create gldeinterlace element")
+        };
+        let method = deinterlace_element.get_property("method").unwrap();
+        let enum_class = glib::EnumClass::new(method.type_()).unwrap();
+        let method = enum_class.to_value_by_nick("greedyh").unwrap();
+        deinterlace_element.set_property("method", &method).expect("Could not set 'method' property");
+
+        let deinterlace_sink = gst::Bin::new(None);
+        deinterlace_sink.add_many(&[&videoconvert_element, &deinterlace_element, &video_element]).expect("Failed to add deinterlacer elements");
+        videoconvert_element.link(&deinterlace_element).expect("Failed to link deinterlace element");
+        deinterlace_element.link(&video_element).expect("Failed to link video element");
+        let deinterlace_sink_pad = if is_using_nouveau() {
+            gst::GhostPad::new("sink", &videoconvert_element.get_static_pad("sink").unwrap()).expect("Failed to ghost videoconvert sink pad")
+        } else {
+            let glupload_element = gst::ElementFactory::make("glupload", None).expect("Failed to create glupload element");
+            deinterlace_sink.add(&glupload_element);
+            glupload_element.link(&videoconvert_element).expect("Failed to link videoconvert element");
+            gst::GhostPad::new("sink", &glupload_element.get_static_pad("sink").unwrap()).expect("Failed to ghost glupload sink pad")
+        };
+        deinterlace_sink_pad.set_active(true);
+        deinterlace_sink.add_pad(&deinterlace_sink_pad);
+
         let engine = GStreamerEngine {
+            deinterlace_sink,
             playbin,
-            video_element: video_element.expect("'video_element' is not None, this cannot happen."),
             video_widget: video_widget.expect("'video_widget is not None, this cannot happen."),
         };
-        engine.video_element.set_property("force-aspect-ratio", &true.to_value()).expect("Could not set 'force-aspect-ration' property");
-        engine.playbin.set_property("video-sink", &engine.video_element.to_value()).expect("Could not set 'video-sink' property");
+        engine.playbin.set_property("video-sink", &engine.deinterlace_sink.to_value()).expect("Could not set 'video-sink' property");
         engine.set_subtitles_showing(false);
         Ok(engine)
     }
